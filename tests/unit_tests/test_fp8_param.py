@@ -15,6 +15,8 @@ from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -24,7 +26,12 @@ from megatron.training.global_vars import (
     set_args,
     set_global_variables,
 )
-from megatron.training.training import get_model, setup_model_and_optimizer
+from megatron.training.training import (
+    force_param_sync,
+    get_model,
+    setup_model_and_optimizer,
+    should_disable_forward_pre_hook,
+)
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -56,13 +63,6 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
-def should_disable_forward_pre_hook(args):
-    """Block forward pre-hook for certain configurations."""
-    return (
-        not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
-    )
-
-
 class TestFP8Param:
 
     def setup_method(self, method):
@@ -90,11 +90,13 @@ class TestFP8Param:
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
         config = core_transformer_config_from_args(args)
-        transformer_layer_spec = layer_spec_fn()
+        transformer_layer_spec = layer_spec_fn(
+            num_experts=args.num_experts, moe_grouped_gemm=args.moe_grouped_gemm
+        )
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocal_size,
+            vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -104,6 +106,12 @@ class TestFP8Param:
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
         )
+
+    def _on_model_built(self, model_chunks, optimizer, args):
+        """Optional test hook after distributed model and optimizer construction."""
+
+    def _on_forward_complete(self, model_chunks, optimizer, args, step, num_steps):
+        """Optional test hook after a forward has consumed synchronized parameters."""
 
     def create_test_args(
         self,
@@ -122,7 +130,7 @@ class TestFP8Param:
         sys.argv = ['test_fp8_param.py']
         args = parse_args()
         args.num_layers = 4
-        args.vocal_size = 128800
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
@@ -171,6 +179,43 @@ class TestFP8Param:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
+    def copy_main_params_to_param_buffer(self, model_chunks, optimizer):
+        # Mirrors MBridge's pre-eval fix: disable_forward_pre_hook(param_sync=True)
+        # force-syncs params before eval callbacks run, so MXFP8 must repopulate
+        # the shared param/grad buffer before disabling forward hooks.
+        for model_chunk in model_chunks:
+            model_chunk.zero_grad_buffer()
+        for optim_instance in optimizer.chained_optimizers:
+            if isinstance(optim_instance, DistributedOptimizer):
+                optim_instance._copy_main_params_to_param_buffer()
+
+    def run_eval_transition(self, args, model_chunks, optimizer, batch):
+        input_ids, labels, position_ids, attention_mask, loss_mask = batch
+
+        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+            self.copy_main_params_to_param_buffer(model_chunks, optimizer)
+
+        if should_disable_forward_pre_hook(args):
+            disable_forward_pre_hook(model_chunks, param_sync=True)
+
+        model_chunks[0].eval()
+        model_chunks[0].set_is_first_microbatch()
+        with torch.no_grad():
+            eval_output = model_chunks[0].forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+        eval_loss = eval_output.mean()
+        model_chunks[0].train()
+
+        if should_disable_forward_pre_hook(args):
+            enable_forward_pre_hook(model_chunks)
+
+        return eval_loss.item()
+
     def _run_test_helper(
         self,
         tp_size,
@@ -178,9 +223,14 @@ class TestFP8Param:
         inference: bool = False,
         fp8_param_gather: bool = True,
         use_cuda_graph: bool = False,
+        eval_transition: bool = False,
         **kwargs,
     ):
-        """Test fp8_param with gpt_model."""
+        """Test fp8_param with a small GPT model."""
+        # Test-only knob: not a model arg, so pop before create_test_args (which asserts every
+        # kwarg is a real arg attribute).
+        save_at_steps_kw = kwargs.pop("save_at_steps", ())
+        num_steps = kwargs.pop("num_steps", 100)
         args = self.create_test_args(
             tp_size,
             recipe,
@@ -199,22 +249,56 @@ class TestFP8Param:
 
         set_args(args)
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=args.expert_model_parallel_size,
+            expert_tensor_parallel_size=args.expert_tensor_parallel_size,
+            # Enable GTP weight-remat when the test requested it (default 1 => no GTP, so
+            # non-GTP fp8 tests are unaffected).
+            gtp_remat_size=getattr(args, "gtp_weight_remat_size", 1),
+            expert_gtp_remat_size=getattr(args, "expert_gtp_weight_remat_size", 1),
+        )
 
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
         )
+        # Mirror production RNG initialization. CUDA-graph validation enables the TE RNG
+        # tracker, whose graph-safe states must be torch.Generator objects rather than the
+        # Tensor states produced by the default MCore tracker. Each helper invocation may
+        # follow a test using a different tracker, so replace the process-global tracker.
+        model_parallel_cuda_manual_seed(
+            _SEED,
+            te_rng_tracker=args.te_rng_tracker,
+            use_cudagraphable_rng=args.cuda_graph_impl != "none",
+            force_reset_rng=True,
+        )
+        model_class = "hybrid" if args.hybrid_layer_pattern is not None else "gpt"
+        cfg_container = Utils.pretrain_config_from_global_args(args, model_class)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         if inference:
-            gpt_model = get_model(
-                self.model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False
+            model_cfg = cfg_container.model
+            builder_cls = model_cfg.get_builder_cls()
+            builder = builder_cls(model_cfg)
+            gpt_model = builder.build_distributed_models(
+                pg_collection=pg_collection, wrap_with_ddp=False
             )
             gpt_model[0].eval()
             optimizer = None
         else:
             gpt_model, optimizer, _ = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                ModelType.encoder_or_decoder,
+                self.model_provider,
+                cfg_container=cfg_container,
+                pg_collection=pg_collection,
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
+        if getattr(args, "use_layer_wise_distributed_optimizer", False):
+            has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
+            assert has_param_layout == args.use_layer_wise_param_layout, (
+                "LayerWise test did not enter the requested parameter-layout path: "
+                f"requested={args.use_layer_wise_param_layout}, actual={has_param_layout}"
+            )
+        self._on_model_built(gpt_model, optimizer, args)
 
         # Hard coded to use cuda_graph_impl="transformer_engine"
         cuda_graph_impl = "transformer_engine"
@@ -237,14 +321,21 @@ class TestFP8Param:
             if is_float8tensor(param):
                 num_fp8_params += 1
 
-        # Verify the number of fp8 params.
         fp8_layers = args.num_layers
         if kwargs.get("first_last_layers_bf16", False):
             fp8_layers -= kwargs["num_layers_at_start_in_bf16"]
             fp8_layers -= kwargs["num_layers_at_end_in_bf16"]
-        # Each layer has 4 GEMM weights: qkv, proj, fc1, fc2.
-        if fp8_param_gather:
-            assert num_fp8_params == 4 * fp8_layers
+        if fp8_param_gather and fp8_layers > 0:
+            if args.num_experts is None:
+                # Each dense layer has 4 GEMM weights: qkv, proj, fc1, fc2.
+                assert num_fp8_params == 4 * fp8_layers
+            else:
+                assert num_fp8_params > 0
+                assert any(
+                    not getattr(param, 'allreduce', True) for param in gpt_model[0].parameters()
+                )
+                if not inference:
+                    assert len(optimizer.chained_optimizers) >= 2
 
         # Verify that bf16 params (embedding, LN, etc.) in the MXFP8 model are mapped
         # to the param buffer (shared with grad buffer) rather than allocated separately.
@@ -269,11 +360,39 @@ class TestFP8Param:
                         )
 
         loss_list = []
+        eval_loss_list = []
 
-        for i in range(100):
+        # Production starts overlapped training with parameter-gather pre-hooks disabled: model
+        # initialization/checkpoint loading has already populated the forward weights, and the
+        # reused grad buffer must stay empty for the first backward. Enable the hooks only after
+        # the first successful optimizer step. CUDA-graph tests retain their existing capture-time
+        # hook lifecycle, which handles this transition separately.
+        first_iteration_pre_hook_disabled = (
+            not inference and not use_cuda_graph and should_disable_forward_pre_hook(args)
+        )
+        if first_iteration_pre_hook_disabled:
+            disable_forward_pre_hook(gpt_model, param_sync=False)
+
+        # Optional: generate the sharded_state_dict (the checkpoint-save metadata path) at these
+        # steps to catch save side-effects on the live weights — a correct save must not perturb
+        # the subsequent training step (regression guard for GTP native-FP8 save corruption).
+        save_at_steps = set(save_at_steps_kw or ())
+
+        for i in range(num_steps):
             if not inference:
                 gpt_model[0].zero_grad_buffer()
                 optimizer.zero_grad()
+
+            if i in save_at_steps:
+                # Mirror production save_checkpoint_and_time: when the forward pre-hook is disabled
+                # for the save, a forced param-sync runs first. Passing the optimizer makes it copy
+                # the FP32 masters into the param buffer before the copy-back re-quantizes, so
+                # native-FP8 GTP shards are refreshed from masters (not stale grad scratch).
+                # Exercise it so the save-perturbation test is a real regression test for the
+                # post-save loss spike.
+                if should_disable_forward_pre_hook(args):
+                    force_param_sync(gpt_model, optimizer=optimizer)
+                _ = gpt_model[0].sharded_state_dict()
 
             # Capture CUDA graphs after warmup if helper is provided.
             # Hard coded cuda_graph_warmup_steps = 0.
@@ -289,10 +408,15 @@ class TestFP8Param:
             # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
             # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
             # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                for optim_instance in optimizer.chained_optimizers:
-                    if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
-                        optim_instance._copy_main_params_to_param_buffer()
+            forward_pre_hook_enabled = bool(
+                getattr(gpt_model[0], 'remove_forward_pre_hook_handles', {})
+            )
+            if (
+                args.reuse_grad_buf_for_mxfp8_param_ag
+                and args.overlap_param_gather
+                and forward_pre_hook_enabled
+            ):
+                self.copy_main_params_to_param_buffer(gpt_model, optimizer)
 
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
@@ -302,6 +426,7 @@ class TestFP8Param:
                 labels=labels,
                 loss_mask=loss_mask,
             )
+            self._on_forward_complete(gpt_model, optimizer, args, i, num_steps)
 
             # Check output shapes
             assert output.shape[0] == self.micro_batch_size
@@ -323,16 +448,32 @@ class TestFP8Param:
             update_successful, _, _ = optimizer.step()
             assert update_successful
 
+            if first_iteration_pre_hook_disabled:
+                enable_forward_pre_hook(gpt_model)
+                first_iteration_pre_hook_disabled = False
+
             loss_list.append(loss.item())
+
+            if eval_transition:
+                eval_loss_list.append(
+                    self.run_eval_transition(
+                        args,
+                        gpt_model,
+                        optimizer,
+                        (input_ids, labels, position_ids, attention_mask, loss_mask),
+                    )
+                )
 
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
             self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
 
+        if eval_transition:
+            return torch.tensor(loss_list), torch.tensor(eval_loss_list)
         return torch.tensor(loss_list)
 
     def run_test(self, tp_size, recipe, inference: bool = False, **kwargs):
-        """Test fp8_param with gpt_model."""
+        """Test fp8_param with a small GPT model."""
         if inference:
             with torch.inference_mode():
                 self._run_test_helper(tp_size, recipe, inference=True, **kwargs)
@@ -355,6 +496,16 @@ class TestFP8Param:
             tp_size, recipe, fp8_param_gather=True, use_cuda_graph=False, **kwargs
         )
         torch.testing.assert_close(loss, loss_ref, atol=0, rtol=0)
+
+    def run_test_with_eval_transition(self, tp_size, recipe, **kwargs):
+        loss, eval_loss = self._run_test_helper(
+            tp_size, recipe, fp8_param_gather=True, eval_transition=True, **kwargs
+        )
+        loss_ref, eval_loss_ref = self._run_test_helper(
+            tp_size, recipe, fp8_param_gather=False, eval_transition=True, **kwargs
+        )
+        torch.testing.assert_close(loss, loss_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(eval_loss, eval_loss_ref, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.parametrize("tp_size", [2])
@@ -428,6 +579,7 @@ class TestFP8Param:
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test_with_cuda_graph(tp_size, "blockwise", **kwargs)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
@@ -442,6 +594,49 @@ class TestFP8Param:
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [1])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (False, True), (True, True)])
+    def test_mxfp8_moe(self, tp_size, dp_overlap):
+        """
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        kwargs = {
+            "overlap_param_gather": dp_overlap[0],
+            "overlap_grad_reduce": dp_overlap[1],
+            "num_layers": 4,
+            "padded_vocab_size": 128800,
+            "hidden_size": 128,
+            "num_attention_heads": 8,
+            "expert_model_parallel_size": 2,
+            "num_experts": 2,
+            "moe_grouped_gemm": True,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_router_topk": 1,
+            "moe_router_pre_softmax": True,
+            "moe_router_load_balancing_type": "none",
+            "moe_aux_loss_coeff": 0.0,
+            "moe_ffn_hidden_size": 128,
+        }
+        self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    def test_mxfp8_eval_transition(self, tp_size):
+        kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
+        self.run_test_with_eval_transition(tp_size=tp_size, recipe="mxfp8", **kwargs)
+
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )

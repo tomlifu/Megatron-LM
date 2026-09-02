@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing
 import sys
@@ -8,13 +9,61 @@ from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
-from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
 
 try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
 except PackageNotFoundError:
     FLASHINFER_JIT_CACHE_VERSION = None
+
+
+class InferenceMode:
+    """Process-wide flag indicating whether an inference engine is currently using the model.
+
+    Modules that need to distinguish between inference and non-inference (e.g. training,
+    RL logprobs) paths should read `InferenceMode.is_active()` rather than relying on
+    `self.training`, `torch.is_grad_enabled()`, or `inference_context is not None`.
+    """
+
+    _is_active: bool = False
+    _use_bounded_mxfp8_rows: bool = False
+
+    @classmethod
+    def is_active(cls) -> bool:
+        """Return True while an inference engine is currently using the model."""
+        return cls._is_active
+
+    @classmethod
+    def set_active(cls) -> None:
+        """Mark the inference engine active and reset its phase to the safe default."""
+        cls._is_active = True
+        cls._use_bounded_mxfp8_rows = False
+
+    @classmethod
+    def set_bounded_mxfp8_rows(cls, enabled: bool) -> None:
+        """Select bounded FlashInfer MXFP8 rows for the current inference step."""
+        cls._use_bounded_mxfp8_rows = enabled
+
+    @classmethod
+    def use_bounded_mxfp8_rows(cls) -> bool:
+        """Return whether the current step may use the configured bounded row prefix."""
+        return cls._use_bounded_mxfp8_rows
+
+    @classmethod
+    def unset_active(cls) -> None:
+        """Mark the inference engine as inactive. Idempotent."""
+        cls._is_active = False
+        cls._use_bounded_mxfp8_rows = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def active(cls):
+        """Context manager: set the flag for the duration of the `with` block."""
+        cls.set_active()
+        try:
+            yield
+        finally:
+            cls.unset_active()
 
 
 def device_memory_summary() -> str:
@@ -80,6 +129,8 @@ def _init_moe_expert_cache(model):
     """
     Initialize the cache of MoE layers once
     """
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
     global moe_layer_cache
     if moe_layer_cache is not None:
         return  # already initialized

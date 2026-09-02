@@ -24,6 +24,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -118,6 +119,7 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
         )
 
     def teardown_method(self, method):
+        InferenceMode.unset_active()
         delete_cuda_graphs()
 
     @classmethod
@@ -209,6 +211,10 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
     @pytest.mark.asyncio
     async def test_streaming(self):
         self.setup_engine(legacy=True)
+
+        # Possible for a rank to not generate any tokens, i.e. EOD only.
+        # Make that impossible when testing streaming.
+        self.mock_tokenizer.eod = self.vocab_size
 
         async def collect_stream(stream_generator, num_tokens_to_generate):
             prev_log_probs = None
@@ -313,6 +319,7 @@ class TestStaticInferenceEngineParallel(StaticInferenceEngineTestHarness):
     """
 
     def teardown_method(self, method):
+        InferenceMode.unset_active()
         delete_cuda_graphs()
         Utils.destroy_model_parallel()
 

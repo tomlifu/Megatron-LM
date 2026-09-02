@@ -20,7 +20,7 @@ knowledge distillation, pruning, speculative decoding, and more.
 
 ## Major Features
 
-- Start from Hugging Face pretrained model checkpoint with on-the-fly conversion to Megatron-LM checkpoint format.
+- Optimize Megatron-Core distributed checkpoints.
 - Support all kinds of model parallelism (TP, EP, ETP, PP).
 - Export to TensorRT-LLM, vLLM, and SGLang ready unified checkpoint.
 
@@ -35,6 +35,7 @@ knowledge distillation, pruning, speculative decoding, and more.
 | `nvidia/NVIDIA-Nemotron-Nano-9B-v2` | ✅ | - | ✅ | ✅ |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | ✅ | - | ✅ | ✅ |
 | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` | ✅ | - | ✅ | ✅ |
+| `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` | ✅ | - | ✅ | ✅ |
 | `openai/gpt-oss-{20b, 120b}` | ✅ | **Online** | ✅ | ✅ |
 | `Qwen/Qwen3-{0.6B, 8B}` | ✅ | ✅ | ✅ | ✅ |
 | `Qwen/Qwen3-{30B-A3B, 235B-A22B}` | **WAR** | ✅ | ✅ | ✅ |
@@ -49,13 +50,58 @@ Alternatively, you can install from [source](https://github.com/NVIDIA/Model-Opt
 to try our latest features.
 
 > **❗ IMPORTANT:** The first positional argument (e.g. `meta-llama/Llama-3.2-1B-Instruct`) of each script
-> is the config name used to match the supported model config in `conf/`. The pretrained HF checkpoint should
-> be downloaded and provided through `${HF_MODEL_CKPT}`.
+> is the config name used to match the supported model config in `conf/`.
+
+### Megatron-Core Checkpoint Prerequisite
+
+All examples in this folder, including examples for post-training quantization (PTQ) and quantization-aware training (QAT) or distillation (QAD), require a Megatron-Core
+distributed checkpoint. Direct Hugging Face import in the ModelOpt scripts is deprecated; use the
+[Megatron-Bridge stable checkpoint conversion CLI](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/conversion#2-stable-checkpoint-conversion-cli)
+to import the model first. If you want to start directly from a Hugging Face checkpoint for
+quantization, use the [Megatron-Bridge quantization examples](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/quantization).
+
+The [NVIDIA NGC NeMo container catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/nemo/-/tags)
+lists the current release. The example below uses `26.08`; the NeMo container provides
+Megatron-Bridge at `/opt/Megatron-Bridge`. It mounts a local Hugging Face model and a directory
+for the imported checkpoint.
+
+```sh
+HF_MODEL_PATH=/path/to/hf/Llama-3.2-1B-Instruct
+MEGATRON_MODEL_PATH=/path/to/checkpoints/Llama-3.2-1B-Instruct
+HF_TOKEN=<your_hugging_face_access_token>
+
+docker run --rm -it --shm-size=24g \
+    -e HF_TOKEN \
+    -v "${HF_MODEL_PATH}:/models/hf/Llama-3.2-1B-Instruct:ro" \
+    -v "${MEGATRON_MODEL_PATH}:/models/megatron/Llama-3.2-1B-Instruct" \
+    -w /opt/Megatron-Bridge \
+    nvcr.io/nvidia/nemo:26.08 \
+    ./scripts/conversion/convert.sh import \
+        --executor local --device cpu \
+        --hf-model /models/hf/Llama-3.2-1B-Instruct \
+        --megatron-path /models/megatron/Llama-3.2-1B-Instruct
+```
+
+#### Choosing CPU or GPU for the import
+
+Use `--device cpu` for a single-process import when the model and conversion working set fit in
+host memory. This is the simplest choice for the Llama 3.2 1B example above and does not require
+GPUs or model parallelism. Use `--device gpu` with `--gpus-per-node` (and, when needed, `--nodes`)
+when host memory is insufficient, when the target checkpoint needs tensor, pipeline, or expert
+parallelism, or when a distributed import is more practical for a large model. Model size alone
+does not require GPU import: a sufficiently high-memory CPU node can import even a large model;
+GPU import shards the work and memory across ranks. For GPU import, set `--tp`, `--pp`, and `--ep`
+to the intended checkpoint layout.
+
+Set `HF_TOKEN` to a Hugging Face access token before starting the import; it is required for gated
+models and is passed into the container by `-e HF_TOKEN`. Set `--tp`, `--pp`, and `--ep` for the
+target parallelism. Consult the Megatron-Bridge conversion documentation for supported architectures
+and distributed examples.
 
 
-### ⭐ NVFP4 Quantization, Qauntization-Aware Training, and Model Export
+### ⭐ NVFP4 Quantization, Quantization-Aware Training, and Model Export
 
-Provide the pretrained checkpoint path through variable `${HF_MODEL_CKPT}` and provide variable
+Provide the imported Megatron-Core checkpoint through `${MLM_MODEL_CKPT}` and provide variable
 `${MLM_MODEL_SAVE}` which stores a resumeable Megatron-LM distributed checkpoint. To export
 Hugging Face-Like quantized checkpoint for TensorRT-LLM, vLLM, or SGLang deployement,
 provide `${EXPORT_DIR}` to `export.sh`.
@@ -70,13 +116,12 @@ provide `${EXPORT_DIR}` to `export.sh`.
 ```sh
 \
     TP=1 \
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=<megatron_core_checkpoint> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct_quant \
     ./quantize.sh meta-llama/Llama-3.2-1B-Instruct NVFP4_DEFAULT_CFG 
 
 \
     PP=1 \
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
     MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
     EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
     ./export.sh meta-llama/Llama-3.2-1B-Instruct
@@ -88,13 +133,52 @@ export the model with flag `--export-vllm-fq`:
 \
     PP=1 \
     MLM_EXTRA_ARGS=--export-vllm-fq \
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
     MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
     EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
     ./export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
 
 For KV cache quantization, add a flag like `MLM_EXTRA_ARGS="--export-kv-cache-quant fp8"` while specifying your desired KV cache precision (see `KV_QUANT_CFG_CHOICES` in `quantize.py`).
+
+### ⭐ Auto Quantize (Mixed-Precision Search)
+
+Auto Quantize uses `mtq.auto_quantize` to perform a per-layer mixed-precision search, assigning each
+layer the best quantization format (e.g. NVFP4 or FP8) subject to a target effective-bits constraint.
+This produces a model that is more accurate than uniform quantization at the same average bit-width.
+
+Pass `auto` as the second positional argument to `quantize.sh` and provide `--auto-quantize-bits`
+through `MLM_EXTRA_ARGS`. The script will skip `--export-quant-cfg` entirely and drive the search
+via the auto-quantize arguments.
+
+> **Note:** Auto Quantize requires `--pipeline-model-parallel-size 1` (PP=1) and
+> [Model-Optimizer](https://github.com/NVIDIA/Model-Optimizer) **0.46 or greater**
+> (`pip install nvidia-modelopt>=0.46`). Alternatively, install from the
+> [main branch](https://github.com/NVIDIA/Model-Optimizer) for the latest features.
+
+```sh
+\
+    TP=1 \
+    MLM_MODEL_CKPT=<megatron_core_checkpoint> \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct_auto_quant \
+    MLM_EXTRA_ARGS="--auto-quantize-bits 4.0" \
+    ./quantize.sh meta-llama/Llama-3.2-1B-Instruct auto
+
+\
+    PP=1 \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_auto_quant \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_auto_quant_export \
+    ./export.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
+Key arguments (passed via `MLM_EXTRA_ARGS`):
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `--auto-quantize-bits` | *(required)* | Target effective bits per weight (e.g. `4.0`, `4.8`). |
+| `--auto-quantize-formats` | `NVFP4_DEFAULT_CFG FP8_DEFAULT_CFG` | Space-separated list of quant configs to search over. |
+| `--auto-quantize-method` | `gradient` | Sensitivity scoring method (`gradient` or `kl_div`). |
+| `--auto-quantize-score-size` | `128` | Number of samples used for sensitivity scoring. |
+| `--auto-quantize-checkpoint` | `None` | Optional path to save/restore search state across runs. |
 
 ### ⭐ Online BF16 EAGLE3 Training
 
@@ -165,44 +249,46 @@ Then only the draft model is called during training. AL is no longer reported du
 
 ### ⭐ Pruning
 
-Checkout pruning getting started section and guidelines for configuring pruning parameters in the [ModelOpt pruning README](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning).
+Pruning is supported for GPT and Mamba models in Pipeline Parallel mode. The `prune.sh` script
+prunes a model by passing `--prune-export-config '<json_without_spaces>'` to `prune.py` via `MLM_EXTRA_ARGS`.
+The JSON describes the target pruned architecture; calibration data is used to compute importance
+scores that drive the dimension reduction.
 
-Pruning is supported for GPT and Mamba models in Pipeline Parallel mode. Available pruning dimensions are:
-
-- `TARGET_FFN_HIDDEN_SIZE`
-- `TARGET_HIDDEN_SIZE`
-- `TARGET_NUM_ATTENTION_HEADS`
-- `TARGET_NUM_QUERY_GROUPS`
-- `TARGET_MAMBA_NUM_HEADS`
-- `TARGET_MAMBA_HEAD_DIM`
-- `TARGET_NUM_MOE_EXPERTS`
-- `TARGET_MOE_FFN_HIDDEN_SIZE`
-- `TARGET_MOE_SHARED_EXPERT_INTERMEDIATE_SIZE`
-- `TARGET_NUM_LAYERS`
-- `LAYERS_TO_DROP` (comma separated, 1-indexed list of layer numbers to directly drop)
+Supported hyperparameters (any subset can appear as keys in `--prune-export-config`):
+`hidden_size`, `ffn_hidden_size`, `num_attention_heads`, `num_query_groups`, `mamba_num_heads`,
+`mamba_head_dim`, `num_moe_experts`, `moe_ffn_hidden_size`, `moe_shared_expert_intermediate_size`,
+`num_layers`.
 
 Example for depth pruning Qwen3-8B from 36 to 24 layers:
 
 ```sh
 PP=1 \
-TARGET_NUM_LAYERS=24 \
+MLM_EXTRA_ARGS='--prune-export-config {"num_layers":24}' \
 HF_MODEL_CKPT=<pretrained_model_name_or_path> \
 MLM_MODEL_SAVE=Qwen3-8B-Pruned \
 ./prune.sh Qwen/Qwen3-8B
 ```
 
-> [!TIP]
-> If number of layers in the model is not divisible by pipeline parallel size (PP), you can configure uneven
-> PP by setting `MLM_EXTRA_ARGS="--decoder-first-pipeline-num-layers <X> --decoder-last-pipeline-num-layers <Y>"`
+The default calibration dataset is `nemotron-post-training-dataset-v2` (gated, requires
+`hf auth login`). Override it by adding `--calib-dataset <hf_dataset_name_or_local_jsonl>`
+to `MLM_EXTRA_ARGS` (e.g. `cnn_dailymail` for an ungated alternative).
 
 > [!TIP]
-> You can reuse pruning scores for pruning same model again to different architectures by setting
-> `PRUNE_ARGS="--pruning-scores-path <path_to_save_scores>"`
+> If number of layers in the model is not divisible by pipeline parallel size (PP), you can configure uneven
+> PP by adding `--decoder-first-pipeline-num-layers <X> --decoder-last-pipeline-num-layers <Y>` to `MLM_EXTRA_ARGS`.
+
+> [!TIP]
+> You can reuse intermediate pruning scores when pruning the same model again to a different config
+> by adding `--prune-intermediate-ckpt <path_to_cache_dir>` to `MLM_EXTRA_ARGS`.
 
 > [!NOTE]
 > When loading pruned M-LM checkpoint for subsequent steps, make sure overwrite the pruned parameters in the
 > default `conf/` by setting `MLM_EXTRA_ARGS`. E.g.: for loading above pruned Qwen3-8B checkpoint for mmlu, set:
 > `MLM_EXTRA_ARGS="--num-layers 24"`
+
+For NAS-based automatic pruning (search across many candidate architectures and pick the best via
+MMLU scoring), see the [Megatron-Bridge pruning example](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/megatron_bridge#pruning).
+Checkout pruning getting started and general guidelines in the [ModelOpt pruning README](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning).
 
 ### ⭐ Inference and Training
 
